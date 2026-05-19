@@ -57,7 +57,7 @@ cp .env.local.example .env.local
 | 命令 | 作用 |
 | --- | --- |
 | `./scripts/sync_notion_local.sh` | 将仓库内所有 `*.md` 同步到 Notion |
-| `./scripts/sync_notion_local.sh --test-markdown` | 仅测试解析（含 `latex` 公式块），不调用 Notion API |
+| `./scripts/sync_notion_local.sh --test-markdown` | 仅测试解析（块级/行内公式），不调用 Notion API |
 | `./scripts/sync_notion_local.sh --dry-run` | 列出将解析的文件与公式块数量，不调用 Notion API |
 
 也可不用 `.env.local`，直接在终端导出环境变量后执行同一脚本：

@@ -295,7 +295,121 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
     ) from last_error
 
 
-LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)|<(https?://[^>\s]+)>|(https?://[^\s)>,]+)")
+# Rich text: links, $inline math$, **bold**, `math-ish backticks` (not code style).
+RICH_SEGMENT_RE = re.compile(
+    r"\[(?P<link_label>[^\]]+)\]\((?P<link_url>[^)]+)\)"
+    r"|<(?P<autolink>https?://[^>\s]+)>"
+    r"|(?P<autolink_bare>https?://[^\s)>,]+)"
+    r"|\$(?P<math>[^$\n]+)\$"
+    r"|\*\*(?P<bold>[^*]+)\*\*"
+    r"|`(?P<backtick>[^`]+)`"
+)
+
+# Backtick content -> KaTeX for Notion inline equations (exact matches first).
+BACKTICK_TO_LATEX: dict[str, str] = {
+    "pi": r"\pi",
+    "qdot": r"\dot{q}",
+    "omega": r"\omega",
+    "lambda": r"\lambda",
+    "tau": r"\tau",
+    "alpha": r"\alpha",
+    "gamma": r"\gamma",
+    "phi": r"\phi",
+    "phi_bar": r"\bar{\phi}",
+    "rho_tempo": r"\rho_{\mathrm{tempo}}",
+    "g_0": r"g_0",
+    "g_proj": r"g_{\mathrm{proj}}",
+    "f_c": r"f_c",
+    "f_theta": r"f_\theta",
+    "q_default": r"q_{\mathrm{default}}",
+    "action_scale": r"\alpha_{\mathrm{scale}}",
+    "I_sec": r"I_{\mathrm{sec}}",
+    "Delta t": r"\Delta t",
+    "T_beat": r"T_{\mathrm{beat}}",
+    "E_obs": r"E_{\mathrm{obs}}",
+    "e_rms": r"e_{\mathrm{rms}}",
+    "V^pi": r"V^{\pi}",
+    "mu_t": r"\mu_t",
+    "c_t": r"c_t",
+    "s_t": r"s_t",
+    "a_t": r"a_t",
+    "r_t": r"r_t",
+    "q^*": r"q^*",
+    "q*": r"q^*",
+    "K_p, K_d": r"K_p, K_d",
+    "a≈0": r"a \approx 0",
+    "gamma in (0,1]": r"\gamma \in (0,1]",
+    "lambda in [0,1]": r"\lambda \in [0,1]",
+    "phi = 0": r"\phi = 0",
+    "phi = 0.5": r"\phi = 0.5",
+    "phi -> 1": r"\phi \to 1",
+    "P(s'|s,a)": r"P(s' \mid s,a)",
+    "corr(E_obs, e_rms)": r"\mathrm{corr}(E_{\mathrm{obs}}, e_{\mathrm{rms}})",
+    "phi, e_rms, onset": r"\phi, e_{\mathrm{rms}}, o",
+    "g_proj, c_t, a_{t-1}": r"g_{\mathrm{proj}}, c_t, a_{t-1}",
+    "pi, V": r"\pi, V",
+    "gamma, lambda": r"\gamma, \lambda",
+    "q, qdot": r"q, \dot{q}",
+    "R, omega": r"R, \omega",
+    "C": r"\mathcal{C}",
+    "M": r"M",
+    "b": r"b",
+    "P": r"P",
+    "R": r"R",
+    "A": r"\mathcal{A}",
+    "S": r"\mathcal{S}",
+    "x[n]": r"x[n]",
+    "f_s": r"f_s",
+    "t_i^b": r"t_i^b",
+    "t_k^b": r"t_k^b",
+    "t_{k+1}^b": r"t_{k+1}^b",
+    "t_{t+1}": r"t_{t+1}",
+    "c_{t-K:t}": r"c_{t-K:t}",
+    "o(t)": r"o(t)",
+    "main": "",  # handled as non-math below
+}
+
+# Not math: keep as plain text (no grey code box in Notion).
+BACKTICK_PLAIN_ONLY = frozenset(
+    {
+        "main",
+        "latex",
+        "text",
+        "python",
+        "bash",
+        " ```latex ",
+        "```latex",
+    }
+)
+
+MATH_BACKTICK_RE = re.compile(
+    r"^[a-zA-Z0-9_^{}\\=,\.\-\(\)\[\]≈∈/:\s|']+$"
+)
+
+
+def backtick_to_latex(content: str) -> str | None:
+    raw = content.strip()
+    if not raw or raw in BACKTICK_PLAIN_ONLY:
+        return None
+    if "http://" in raw or "https://" in raw or raw.startswith("```"):
+        return None
+    if raw in BACKTICK_TO_LATEX:
+        mapped = BACKTICK_TO_LATEX[raw]
+        return mapped if mapped else None
+    if MATH_BACKTICK_RE.fullmatch(raw):
+        return raw.replace("≈", r"\approx").replace("->", r"\to").replace("in (", r"\in (")
+    return None
+
+
+def inline_equation(expression: str) -> dict:
+    return {"type": "equation", "equation": {"expression": expression.strip()}}
+
+
+def text_segment(content: str, *, bold: bool = False) -> dict:
+    part: dict = {"type": "text", "text": {"content": content}}
+    if bold:
+        part["annotations"] = {"bold": True}
+    return part
 
 
 def rich_text(text: str) -> list[dict]:
@@ -305,26 +419,38 @@ def rich_text(text: str) -> list[dict]:
 
     parts: list[dict] = []
     cursor = 0
-    for match in LINK_PATTERN.finditer(text):
+    for match in RICH_SEGMENT_RE.finditer(text):
         if match.start() > cursor:
-            parts.append({"type": "text", "text": {"content": text[cursor : match.start()]}})
+            parts.append(text_segment(text[cursor : match.start()]))
 
-        if match.group(1):
-            label = match.group(1)
-            target = match.group(2).strip()
+        groups = match.groupdict()
+        if groups.get("math") is not None:
+            parts.append(inline_equation(groups["math"]))
+        elif groups.get("backtick") is not None:
+            latex = backtick_to_latex(groups["backtick"])
+            if latex:
+                parts.append(inline_equation(latex))
+            else:
+                parts.append(text_segment(groups["backtick"]))
+        elif groups.get("bold") is not None:
+            parts.append(text_segment(groups["bold"], bold=True))
+        elif groups.get("link_label") is not None:
+            label = groups["link_label"]
+            target = groups["link_url"].strip()
             url = target if target.startswith(("http://", "https://")) else INTERNAL_LINKS.get(target)
-        else:
-            url = match.group(3) or match.group(4)
-            label = url
-
-        if url:
-            parts.append({"type": "text", "text": {"content": label, "link": {"url": url}}})
-        else:
-            parts.append({"type": "text", "text": {"content": label}})
+            if url:
+                parts.append(
+                    {"type": "text", "text": {"content": label, "link": {"url": url}}}
+                )
+            else:
+                parts.append(text_segment(label))
+        elif groups.get("autolink") or groups.get("autolink_bare"):
+            url = groups.get("autolink") or groups.get("autolink_bare")
+            parts.append({"type": "text", "text": {"content": url, "link": {"url": url}}})
         cursor = match.end()
 
     if cursor < len(text):
-        parts.append({"type": "text", "text": {"content": text[cursor:]}})
+        parts.append(text_segment(text[cursor:]))
 
     return parts
 
@@ -762,9 +888,22 @@ def main() -> int:
     return 0
 
 
+def _test_rich_text() -> None:
+    parts = rich_text("- `pi`：策略，即控制律。$c_t$ 与 **闭环**。")
+    types = [p["type"] for p in parts]
+    assert types.count("equation") >= 2, types
+    assert any(p["type"] == "text" and p.get("annotations", {}).get("bold") for p in parts)
+    pi_eq = next(p for p in parts if p["type"] == "equation" and "\\pi" in p["equation"]["expression"])
+    assert pi_eq
+    print("rich_text inline equation test OK")
+
+
 def _test_markdown_to_blocks() -> None:
     """Smoke-test markdown parsing (no Notion API). Run: python3 scripts/sync_notion.py --test-markdown"""
+    _test_rich_text()
     sample = """### 1.2 带约束
+
+- `pi`：策略
 
 ```latex
 \\max_{\\pi} \\; \\mathbb{E}\\left[ \\sum_{t=0}^{T} \\gamma^t r(s_t,a_t,s_{t+1},c_t) \\right]
@@ -781,6 +920,9 @@ print("not equation")
     eq = next(b for b in blocks if b["type"] == "equation")
     assert "\\max" in eq["equation"]["expression"]
     assert any(b["type"] == "code" for b in blocks)
+    bullet = next(b for b in blocks if b["type"] == "bulleted_list_item")
+    bullet_parts = bullet["bulleted_list_item"]["rich_text"]
+    assert any(p["type"] == "equation" for p in bullet_parts)
     print("markdown_to_blocks equation test OK")
 
 
