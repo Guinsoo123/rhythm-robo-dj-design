@@ -126,6 +126,11 @@ NOTION_CODE_LANGUAGES = frozenset(
     }
 )
 
+# Fenced code languages that become Notion equation blocks (KaTeX), not code blocks.
+EQUATION_FENCE_LANGUAGES = frozenset({"latex", "tex", "math", "equation", "katex"})
+# Notion equation.expression length limit (API docs do not state a cap; keep conservative).
+MAX_EQUATION_EXPRESSION_LEN = 2000
+
 MARKDOWN_CODE_LANGUAGE_ALIASES = {
     "": "plain text",
     "text": "plain text",
@@ -216,10 +221,25 @@ def page_id_key(page_id: str) -> str:
     return page_id.replace("-", "").lower()
 
 
-TOKEN = env("NOTION_TOKEN")
-PARENT_PAGE_ID = normalize_notion_page_id(env("NOTION_PARENT_PAGE_ID"))
+_TOKEN: str | None = None
+_PARENT_PAGE_ID: str | None = None
 
-# title -> Notion page id for direct children of PARENT_PAGE_ID (filled each run).
+
+def notion_token() -> str:
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = env("NOTION_TOKEN")
+    return _TOKEN
+
+
+def notion_parent_page_id() -> str:
+    global _PARENT_PAGE_ID
+    if _PARENT_PAGE_ID is None:
+        _PARENT_PAGE_ID = normalize_notion_page_id(env("NOTION_PARENT_PAGE_ID"))
+    return _PARENT_PAGE_ID
+
+
+# title -> Notion page id for direct children of the parent page (filled each run).
 CHILD_PAGE_INDEX: dict[str, str] = {}
 # markdown relative path -> Notion page URL (filled each run).
 INTERNAL_LINKS: dict[str, str] = {}
@@ -229,7 +249,7 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     url = f"https://api.notion.com/v1{path}"
     headers = {
-        "Authorization": f"Bearer {TOKEN}",
+        "Authorization": f"Bearer {notion_token()}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
@@ -341,6 +361,55 @@ def code_block(lines: list[str], language: str = "plain text") -> dict:
     }
 
 
+def is_equation_fence(language: str) -> bool:
+    return language.strip().lower() in EQUATION_FENCE_LANGUAGES
+
+
+def latex_lines_to_expression(lines: list[str]) -> str:
+    """Merge fenced LaTeX lines into one Notion/KaTeX expression."""
+    parts: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%"):
+            continue
+        parts.append(stripped)
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return r" \\ ".join(parts)
+
+
+def equation_block(expression: str) -> dict:
+    expression = expression.strip()
+    if len(expression) > MAX_EQUATION_EXPRESSION_LEN:
+        expression = expression[:MAX_EQUATION_EXPRESSION_LEN]
+    return {
+        "object": "block",
+        "type": "equation",
+        "equation": {"expression": expression},
+    }
+
+
+def equation_blocks_from_latex(lines: list[str]) -> list[dict]:
+    """Build one or more equation blocks from a ```latex fenced region."""
+    expr = latex_lines_to_expression(lines)
+    if not expr:
+        return [paragraph("(empty equation)")]
+
+    if len(expr) <= MAX_EQUATION_EXPRESSION_LEN:
+        return [equation_block(expr)]
+
+    # Very long derivations: one Notion equation block per non-empty line.
+    blocks: list[dict] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%"):
+            continue
+        blocks.append(equation_block(stripped))
+    return blocks or [equation_block(expr[:MAX_EQUATION_EXPRESSION_LEN])]
+
+
 def is_table_line(line: str) -> bool:
     stripped = line.strip()
     return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
@@ -388,6 +457,7 @@ def markdown_to_blocks(markdown: str) -> list[dict]:
     in_code = False
     code_lines: list[str] = []
     code_language = "plain text"
+    fence_language_raw = ""
     lines = markdown.splitlines()
 
     def flush_pending() -> None:
@@ -402,14 +472,19 @@ def markdown_to_blocks(markdown: str) -> list[dict]:
 
         if line.startswith("```"):
             if in_code:
-                blocks.append(code_block(code_lines, code_language))
+                if is_equation_fence(fence_language_raw):
+                    blocks.extend(equation_blocks_from_latex(code_lines))
+                else:
+                    blocks.append(code_block(code_lines, code_language))
                 in_code = False
                 code_lines = []
                 code_language = "plain text"
+                fence_language_raw = ""
             else:
                 flush_pending()
                 in_code = True
-                code_language = normalize_notion_code_language(line[3:].strip())
+                fence_language_raw = line[3:].strip().lower()
+                code_language = normalize_notion_code_language(fence_language_raw)
             index += 1
             continue
 
@@ -457,7 +532,10 @@ def markdown_to_blocks(markdown: str) -> list[dict]:
 
     flush_pending()
     if in_code:
-        blocks.append(code_block(code_lines, code_language))
+        if is_equation_fence(fence_language_raw):
+            blocks.extend(equation_blocks_from_latex(code_lines))
+        else:
+            blocks.append(code_block(code_lines, code_language))
     return blocks
 
 
@@ -502,7 +580,7 @@ def list_pages_under_parent() -> dict[str, list[str]]:
             parent = item.get("parent", {})
             if parent.get("type") != "page_id":
                 continue
-            if page_id_key(parent.get("page_id", "")) != page_id_key(PARENT_PAGE_ID):
+            if page_id_key(parent.get("page_id", "")) != page_id_key(notion_parent_page_id()):
                 continue
             title = page_object_title(item)
             if not title:
@@ -568,7 +646,7 @@ def clear_children(page_id: str) -> None:
 
 def create_page(title: str) -> str:
     payload = {
-        "parent": {"type": "page_id", "page_id": PARENT_PAGE_ID},
+        "parent": {"type": "page_id", "page_id": notion_parent_page_id()},
         "properties": {"title": {"title": rich_text(title)}},
     }
     page_id = request("POST", "/pages", payload)["id"]
@@ -619,7 +697,7 @@ def parent_child_pages() -> list[dict]:
     cursor = None
     while True:
         suffix = f"?start_cursor={cursor}" if cursor else ""
-        result = request("GET", f"/blocks/{PARENT_PAGE_ID}/children{suffix}")
+        result = request("GET", f"/blocks/{notion_parent_page_id()}/children{suffix}")
         for child in result.get("results", []):
             if child.get("type") == "child_page":
                 pages.append(
@@ -684,5 +762,30 @@ def main() -> int:
     return 0
 
 
+def _test_markdown_to_blocks() -> None:
+    """Smoke-test markdown parsing (no Notion API). Run: python3 scripts/sync_notion.py --test-markdown"""
+    sample = """### 1.2 带约束
+
+```latex
+\\max_{\\pi} \\; \\mathbb{E}\\left[ \\sum_{t=0}^{T} \\gamma^t r(s_t,a_t,s_{t+1},c_t) \\right]
+\\quad \\text{s.t.} \\quad (s_t,a_t) \\in \\mathcal{C}
+```
+
+```python
+print("not equation")
+```
+"""
+    blocks = markdown_to_blocks(sample)
+    types = [b["type"] for b in blocks]
+    assert "equation" in types, types
+    eq = next(b for b in blocks if b["type"] == "equation")
+    assert "\\max" in eq["equation"]["expression"]
+    assert any(b["type"] == "code" for b in blocks)
+    print("markdown_to_blocks equation test OK")
+
+
 if __name__ == "__main__":
+    if "--test-markdown" in sys.argv:
+        _test_markdown_to_blocks()
+        sys.exit(0)
     sys.exit(main())

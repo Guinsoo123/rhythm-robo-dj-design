@@ -39,4 +39,35 @@
 
 ## Notion 同步
 
-本仓库参考 `guinsoo-kaoyan-notes` 的同步方式：`.github/workflows/sync-notion.yml` 在 `main` 分支 push 后执行 `scripts/sync_notion.py`，把仓库内 Markdown 文件同步到 Notion 父页面。配置方式见 [Notion同步说明](04-同步与交付/Notion同步说明.md)。
+设计文档可同步到 Notion 父页面：[Rhythm Robo DJ（Notion）](https://www.notion.so/364e7deff2df806bbdfef25534d88078)。
+
+### 一键本地同步（无需 push GitHub）
+
+在仓库根目录执行：
+
+```bash
+# 首次：从模板创建本地密钥文件（已在 .gitignore，不会提交）
+cp .env.local.example .env.local
+# 编辑 .env.local，填入 NOTION_TOKEN 与 NOTION_PARENT_PAGE_ID
+
+# 一键同步全部 Markdown
+./scripts/sync_notion_local.sh
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `./scripts/sync_notion_local.sh` | 将仓库内所有 `*.md` 同步到 Notion |
+| `./scripts/sync_notion_local.sh --test-markdown` | 仅测试解析（含 `latex` 公式块），不调用 Notion API |
+| `./scripts/sync_notion_local.sh --dry-run` | 列出将解析的文件与公式块数量，不调用 Notion API |
+
+也可不用 `.env.local`，直接在终端导出环境变量后执行同一脚本：
+
+```bash
+export NOTION_TOKEN="your_integration_token"
+export NOTION_PARENT_PAGE_ID="https://www.notion.so/364e7deff2df806bbdfef25534d88078"
+./scripts/sync_notion_local.sh
+```
+
+**安全提醒**：不要把 `NOTION_TOKEN` 写进 Git 或发到公开渠道；仅放在 `.env.local` 或 GitHub Actions Secrets。Notion 父页面需在 Share 中授权你的 Integration。
+
+更完整的说明（含 GitHub Actions 自动同步）见 [Notion同步说明](04-同步与交付/Notion同步说明.md)。

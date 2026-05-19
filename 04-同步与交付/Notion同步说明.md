@@ -23,19 +23,37 @@
 5. 添加 `NOTION_PARENT_PAGE_ID`，值为 Notion 父页面 ID 或完整页面 URL。
 6. 在 Notion 父页面右上角 `Share`，把对应 integration 加入权限。
 
-## 本地手动同步
+## 一键本地同步（推荐，无需 push GitHub）
+
+Notion 父页面：[https://www.notion.so/364e7deff2df806bbdfef25534d88078](https://www.notion.so/364e7deff2df806bbdfef25534d88078)
 
 ```bash
-cd /Users/guinsoo/rhythm-robo-dj-design
-export NOTION_TOKEN="secret_xxx"
-export NOTION_PARENT_PAGE_ID="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-python3 scripts/sync_notion.py
+cd /path/to/rhythm-robo-dj-design
+
+# 首次配置
+cp .env.local.example .env.local
+# 编辑 .env.local：填入 NOTION_TOKEN（Integration secret）
+
+# 同步
+chmod +x scripts/sync_notion_local.sh   # 仅需一次
+./scripts/sync_notion_local.sh
 ```
 
-单次运行：
+脚本会读取 `.env.local`（已加入 `.gitignore`），调用 `scripts/sync_notion.py` 将全部 Markdown 同步为 Notion 子页面；` ```latex ` 围栏会渲染为公式块。
+
+可选参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--test-markdown` | 校验公式解析，不访问 Notion |
+| `--dry-run` | 统计各文件的块数量，不访问 Notion |
+
+## 本地手动同步（等价于上述脚本核心）
 
 ```bash
-NOTION_TOKEN="secret_xxx" NOTION_PARENT_PAGE_ID="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" python3 scripts/sync_notion.py
+export NOTION_TOKEN="ntn_example"
+export NOTION_PARENT_PAGE_ID="https://www.notion.so/364e7deff2df806bbdfef25534d88078"
+python3 scripts/sync_notion.py
 ```
 
 ## 页面命名规则
@@ -56,8 +74,16 @@ README.md -> Rhythm Robo DJ 设计总览
 
 - 使用一级到三级标题。
 - 使用普通段落、表格、无序列表、任务列表和代码块。
-- 图片和复杂 Mermaid 图可以在 GitHub 中查看，Notion 同步以文本设计文档为主。
+- **数学公式**：使用 ` ```latex ` 围栏（或 `tex` / `math`），同步脚本会创建 Notion **Equation** 块（KaTeX 渲染），而不是代码块。多行公式会合并为同一公式内的换行（`\\`）。
+- 普通代码仍用 ` ```python `、` ```text ` 等围栏。
+- 图片和复杂 Mermaid 图可以在 GitHub 中查看；Mermaid 在 Notion 中仍为代码块。
 - 内部链接尽量使用相对路径，例如 `[算法设计](../02-算法设计/强化学习舞蹈控制.md)`。
+
+本地检查公式解析（不调用 Notion API）：
+
+```bash
+python3 scripts/sync_notion.py --test-markdown
+```
 
 ## 常见报错
 
