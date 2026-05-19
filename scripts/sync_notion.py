@@ -806,12 +806,31 @@ def find_existing_page(title: str) -> str | None:
     return page_id if page_id else None
 
 
+def block_children_path(
+    page_id: str,
+    *,
+    page_size: int | None = None,
+    start_cursor: str | None = None,
+) -> str:
+    """Build Notion list-children path with correct query string (?a=1&b=2)."""
+    params: list[str] = []
+    if page_size is not None:
+        params.append(f"page_size={page_size}")
+    if start_cursor:
+        params.append(f"start_cursor={start_cursor}")
+    if not params:
+        return f"/blocks/{page_id}/children"
+    return f"/blocks/{page_id}/children?" + "&".join(params)
+
+
 def count_block_children(page_id: str) -> int:
     total = 0
     cursor = None
     while True:
-        suffix = f"?start_cursor={cursor}" if cursor else ""
-        result = request("GET", f"/blocks/{page_id}/children?page_size=100{suffix}")
+        result = request(
+            "GET",
+            block_children_path(page_id, page_size=100, start_cursor=cursor),
+        )
         total += len(result.get("results", []))
         if not result.get("has_more"):
             break
@@ -823,8 +842,10 @@ def clear_children(page_id: str) -> None:
     cursor = None
     cleared = 0
     while True:
-        suffix = f"?start_cursor={cursor}" if cursor else ""
-        result = request("GET", f"/blocks/{page_id}/children?page_size=100{suffix}")
+        result = request(
+            "GET",
+            block_children_path(page_id, page_size=100, start_cursor=cursor),
+        )
         children = result.get("results", [])
         if not children:
             break
@@ -908,7 +929,7 @@ def block_plain_text(block: dict) -> str:
 
 
 def page_has_sync_mark(page_id: str) -> bool:
-    result = request("GET", f"/blocks/{page_id}/children?page_size=3")
+    result = request("GET", block_children_path(page_id, page_size=3))
     for child in result.get("results", []):
         if block_plain_text(child).startswith(SYNC_MARK):
             return True
@@ -919,8 +940,10 @@ def parent_child_pages() -> list[dict]:
     pages = []
     cursor = None
     while True:
-        suffix = f"?start_cursor={cursor}" if cursor else ""
-        result = request("GET", f"/blocks/{notion_parent_page_id()}/children{suffix}")
+        result = request(
+            "GET",
+            block_children_path(notion_parent_page_id(), start_cursor=cursor),
+        )
         for child in result.get("results", []):
             if child.get("type") == "child_page":
                 pages.append(
@@ -1053,6 +1076,15 @@ def main() -> int:
     return 0
 
 
+def _test_block_children_path() -> None:
+    first = block_children_path("abc", page_size=100)
+    second = block_children_path("abc", page_size=100, start_cursor="cursor-id")
+    assert first == "/blocks/abc/children?page_size=100"
+    assert second == "/blocks/abc/children?page_size=100&start_cursor=cursor-id"
+    assert "?" not in second.split("&", 1)[-1]
+    print("block_children_path test OK")
+
+
 def _test_rich_text() -> None:
     parts = rich_text("- `pi`：策略，即控制律。$c_t$ 与 **闭环**。")
     types = [p["type"] for p in parts]
@@ -1065,6 +1097,7 @@ def _test_rich_text() -> None:
 
 def _test_markdown_to_blocks() -> None:
     """Smoke-test markdown parsing (no Notion API). Run: python3 scripts/sync_notion.py --test-markdown"""
+    _test_block_children_path()
     _test_rich_text()
     sample = """### 1.2 带约束
 
