@@ -56,6 +56,19 @@ export NOTION_PARENT_PAGE_ID="https://www.notion.so/364e7deff2df806bbdfef25534d8
 python3 scripts/sync_notion.py
 ```
 
+## 大文档拆分（避免同步超时）
+
+单篇 Markdown 解析后若超过约 **200 个 Notion blocks**，清空旧内容时需数百次 API 调用，容易触发 `TimeoutError`。
+
+本仓库已将 `01-数学与学习定义证明推导.md` 拆为：
+
+- 1 篇**索引页**（`01-数学与学习定义证明推导.md`）
+- 5 篇**分册**（`01-数学推导-00-…` ～ `01-数学推导-04-…`）
+
+新增超长文档时，请按 `##` 章节拆成多文件，并在索引页用表格链出各分册。
+
+若某页在 Notion 上仍有大量旧 blocks（例如拆分前的单页），同步脚本会在子块数超过 `200` 且新内容明显更短时**自动归档旧页并新建同名页**（环境变量 `NOTION_RECREATE_CHILDREN_THRESHOLD` 可改）。
+
 ## 页面命名规则
 
 同步脚本会把 Markdown 路径转换成 Notion 页面标题：
@@ -63,6 +76,7 @@ python3 scripts/sync_notion.py
 ```text
 README.md -> Rhythm Robo DJ 设计总览
 02-算法设计/强化学习舞蹈控制.md -> 02-算法设计 / 强化学习舞蹈控制
+02-算法设计/01-数学推导-00-前言与线性代数.md -> 02-算法设计 / 01-数学推导-00-前言与线性代数
 03-软件架构/MuJoCo与Conda仿真平台.md -> 03-软件架构 / MuJoCo与Conda仿真平台
 ```
 

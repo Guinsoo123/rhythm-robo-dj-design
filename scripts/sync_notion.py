@@ -7,6 +7,7 @@ Environment variables:
   NOTION_REQUEST_TIMEOUT: Per-request timeout in seconds (default: 60).
   NOTION_MAX_RETRIES: Retries on timeout / rate limit / 5xx (default: 5).
   NOTION_RETRY_BACKOFF_SEC: Initial backoff between retries in seconds (default: 1.0).
+  NOTION_SYNC_PROGRESS: Set to 0/false/no to disable progress logs (default: enabled).
 """
 
 from __future__ import annotations
@@ -29,6 +30,15 @@ REQUEST_TIMEOUT = int(os.environ.get("NOTION_REQUEST_TIMEOUT", "60"))
 MAX_RETRIES = int(os.environ.get("NOTION_MAX_RETRIES", "5"))
 RETRY_BACKOFF_SEC = float(os.environ.get("NOTION_RETRY_BACKOFF_SEC", "1.0"))
 RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
+# If a page has more than this many child blocks, archive it and create a fresh page
+# instead of PATCH-archiving each block (avoids timeouts after splitting large docs).
+RECREATE_CHILDREN_THRESHOLD = int(os.environ.get("NOTION_RECREATE_CHILDREN_THRESHOLD", "200"))
+PROGRESS_ENABLED = os.environ.get("NOTION_SYNC_PROGRESS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 # Notion code block languages (API rejects aliases like "text" from ```text fences).
 NOTION_CODE_LANGUAGES = frozenset(
@@ -243,6 +253,36 @@ def notion_parent_page_id() -> str:
 CHILD_PAGE_INDEX: dict[str, str] = {}
 # markdown relative path -> Notion page URL (filled each run).
 INTERNAL_LINKS: dict[str, str] = {}
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def log_progress(message: str) -> None:
+    if not PROGRESS_ENABLED:
+        return
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def progress_summary(done: int, total: int, started_at: float) -> str:
+    elapsed = time.perf_counter() - started_at
+    if done <= 0:
+        return f"elapsed {format_duration(elapsed)}, ETA calculating"
+    remaining = max(0, total - done)
+    avg = elapsed / done
+    eta = avg * remaining
+    return (
+        f"elapsed {format_duration(elapsed)}, avg {format_duration(avg)}/file, "
+        f"ETA {format_duration(eta)}"
+    )
 
 
 def request(method: str, path: str, payload: dict | None = None) -> dict:
@@ -738,9 +778,12 @@ def archive_page(page_id: str) -> None:
 def rebuild_child_page_index() -> None:
     """Map each title to one child page; archive duplicate titles from previous runs."""
     global CHILD_PAGE_INDEX
+    started_at = time.perf_counter()
+    log_progress("Scanning existing Notion child pages...")
     CHILD_PAGE_INDEX = {}
     by_title = list_pages_under_parent()
 
+    archived = 0
     for title, page_ids in by_title.items():
         canonical = choose_canonical_page_id(title, page_ids)
         CHILD_PAGE_INDEX[title] = canonical
@@ -748,8 +791,14 @@ def rebuild_child_page_index() -> None:
             if page_id_key(duplicate_id) == page_id_key(canonical):
                 continue
             archive_page(duplicate_id)
+            archived += 1
             print(f"Archived duplicate Notion page: {title}")
             time.sleep(0.1)
+    log_progress(
+        "Page index ready: "
+        f"{len(CHILD_PAGE_INDEX)} titles, {archived} duplicates archived, "
+        f"took {format_duration(time.perf_counter() - started_at)}."
+    )
 
 
 def find_existing_page(title: str) -> str | None:
@@ -757,17 +806,57 @@ def find_existing_page(title: str) -> str | None:
     return page_id if page_id else None
 
 
-def clear_children(page_id: str) -> None:
+def count_block_children(page_id: str) -> int:
+    total = 0
     cursor = None
     while True:
         suffix = f"?start_cursor={cursor}" if cursor else ""
-        result = request("GET", f"/blocks/{page_id}/children{suffix}")
-        for child in result.get("results", []):
-            request("PATCH", f"/blocks/{child['id']}", {"archived": True})
-            time.sleep(0.1)
+        result = request("GET", f"/blocks/{page_id}/children?page_size=100{suffix}")
+        total += len(result.get("results", []))
         if not result.get("has_more"):
             break
         cursor = result.get("next_cursor")
+    return total
+
+
+def clear_children(page_id: str) -> None:
+    cursor = None
+    cleared = 0
+    while True:
+        suffix = f"?start_cursor={cursor}" if cursor else ""
+        result = request("GET", f"/blocks/{page_id}/children?page_size=100{suffix}")
+        children = result.get("results", [])
+        if not children:
+            break
+        for child in children:
+            request("PATCH", f"/blocks/{child['id']}", {"archived": True})
+            cleared += 1
+            if cleared % 20 == 0:
+                time.sleep(0.05)
+        if not result.get("has_more"):
+            break
+        cursor = result.get("next_cursor")
+
+
+def prepare_page_for_sync(page_id: str | None, title: str, new_block_count: int) -> str:
+    """Return a Notion page id ready for new children (create, clear, or recreate)."""
+    if not page_id:
+        return create_page(title)
+
+    old_count = count_block_children(page_id)
+    if old_count > RECREATE_CHILDREN_THRESHOLD and new_block_count < max(
+        80, old_count // 3
+    ):
+        log_progress(
+            f"Recreating Notion page {title}: had {old_count} blocks, "
+            f"uploading {new_block_count} (faster than clearing in place)."
+        )
+        archive_page(page_id)
+        return create_page(title)
+
+    if old_count:
+        clear_children(page_id)
+    return page_id
 
 
 def create_page(title: str) -> str:
@@ -781,12 +870,20 @@ def create_page(title: str) -> str:
 
 
 def ensure_pages(files: list[pathlib.Path]) -> None:
+    started_at = time.perf_counter()
+    created = 0
+    log_progress(f"Ensuring {len(files)} Notion pages exist...")
     for path in files:
         title = page_title(path)
         if title not in CHILD_PAGE_INDEX:
             create_page(title)
+            created += 1
             print(f"Created Notion page: {title}")
             time.sleep(0.1)
+    log_progress(
+        f"Page ensure complete: {created} created, "
+        f"took {format_duration(time.perf_counter() - started_at)}."
+    )
 
 
 def rebuild_internal_links(files: list[pathlib.Path]) -> None:
@@ -839,6 +936,9 @@ def parent_child_pages() -> list[dict]:
 
 
 def archive_stale_synced_pages(active_titles: set[str]) -> None:
+    started_at = time.perf_counter()
+    archived = 0
+    log_progress("Checking for stale synced Notion pages...")
     for page in parent_child_pages():
         title = page["title"]
         page_id = page["id"]
@@ -847,23 +947,49 @@ def archive_stale_synced_pages(active_titles: set[str]) -> None:
         if not page_has_sync_mark(page_id):
             continue
         request("PATCH", f"/pages/{page_id}", {"archived": True})
+        archived += 1
         print(f"Archived stale Notion page: {title}")
         time.sleep(0.1)
+    log_progress(
+        f"Stale page check complete: {archived} archived, "
+        f"took {format_duration(time.perf_counter() - started_at)}."
+    )
 
 
-def sync_file(path: pathlib.Path) -> None:
+def sync_file(
+    path: pathlib.Path,
+    blocks: list[dict],
+    *,
+    index: int,
+    total: int,
+    sync_started_at: float,
+) -> None:
+    file_started_at = time.perf_counter()
     title = page_title(path)
     page_id = find_existing_page(title)
-    if page_id:
-        clear_children(page_id)
-    else:
-        page_id = create_page(title)
+    rel = path.relative_to(ROOT)
+    block_count = len(blocks)
+    chunk_count = (block_count + 99) // 100
+    log_progress(
+        f"[{index}/{total}] Syncing {rel} -> {title} "
+        f"({block_count} blocks, {chunk_count} API append batches)"
+    )
+    log_progress(f"[{index}/{total}] Preparing Notion page for {title}...")
+    page_id = prepare_page_for_sync(page_id, title, block_count)
 
-    blocks = markdown_to_blocks(path.read_text(encoding="utf-8"))
-    for group in chunks(blocks):
+    for batch_index, group in enumerate(chunks(blocks), start=1):
         request("PATCH", f"/blocks/{page_id}/children", {"children": group})
+        log_progress(
+            f"[{index}/{total}] Appended batch {batch_index}/{chunk_count} "
+            f"for {title}"
+        )
         time.sleep(0.1)
-    print(f"Synced {path.relative_to(ROOT)} -> {title}")
+    file_elapsed = time.perf_counter() - file_started_at
+    log_progress(
+        f"[{index}/{total}] Done {rel} in {format_duration(file_elapsed)}; "
+        f"{progress_summary(index, total, sync_started_at)}."
+    )
+    print(f"Synced {rel} -> {title}")
 
 
 def markdown_files() -> list[pathlib.Path]:
@@ -876,15 +1002,54 @@ def markdown_files() -> list[pathlib.Path]:
     return sorted(files)
 
 
+def build_sync_items(files: list[pathlib.Path]) -> list[tuple[pathlib.Path, list[dict]]]:
+    started_at = time.perf_counter()
+    log_progress(f"Parsing {len(files)} Markdown files before upload...")
+    items: list[tuple[pathlib.Path, list[dict]]] = []
+    total_blocks = 0
+    total_equations = 0
+    for index, path in enumerate(files, start=1):
+        blocks = markdown_to_blocks(path.read_text(encoding="utf-8"))
+        items.append((path, blocks))
+        total_blocks += len(blocks)
+        total_equations += sum(1 for block in blocks if block.get("type") == "equation")
+        log_progress(
+            f"[parse {index}/{len(files)}] {path.relative_to(ROOT)}: "
+            f"{len(blocks)} blocks"
+        )
+    total_batches = sum((len(blocks) + 99) // 100 for _, blocks in items)
+    log_progress(
+        "Markdown parse complete: "
+        f"{total_blocks} blocks, {total_equations} equation blocks, "
+        f"{total_batches} API append batches, "
+        f"took {format_duration(time.perf_counter() - started_at)}."
+    )
+    return items
+
+
 def main() -> int:
+    started_at = time.perf_counter()
     files = markdown_files()
+    log_progress(f"Starting Notion sync for {len(files)} Markdown files.")
     active_titles = {page_title(path) for path in files}
     rebuild_child_page_index()
     archive_stale_synced_pages(active_titles)
     ensure_pages(files)
     rebuild_internal_links(files)
-    for path in files:
-        sync_file(path)
+    sync_items = build_sync_items(files)
+    sync_started_at = time.perf_counter()
+    log_progress(f"Uploading {len(sync_items)} files to Notion...")
+    for index, (path, blocks) in enumerate(sync_items, start=1):
+        sync_file(
+            path,
+            blocks,
+            index=index,
+            total=len(sync_items),
+            sync_started_at=sync_started_at,
+        )
+    log_progress(
+        f"Notion sync complete in {format_duration(time.perf_counter() - started_at)}."
+    )
     return 0
 
 
