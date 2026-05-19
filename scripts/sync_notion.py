@@ -23,7 +23,15 @@ import urllib.request
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = os.environ.get("NOTION_VERSION", "2022-06-28")
+# Move-page endpoint needs a newer API version (see Notion "Move a page" docs).
+NOTION_MOVE_PAGE_VERSION = os.environ.get("NOTION_MOVE_PAGE_VERSION", "2025-09-03")
+REORDER_PARENT_PAGES = os.environ.get("NOTION_REORDER_PARENT_PAGES", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 SYNC_MARK = "github-md-sync"
 SKIP_DIRS = {".git", ".github", "scripts"}
 REQUEST_TIMEOUT = int(os.environ.get("NOTION_REQUEST_TIMEOUT", "60"))
@@ -285,12 +293,18 @@ def progress_summary(done: int, total: int, started_at: float) -> str:
     )
 
 
-def request(method: str, path: str, payload: dict | None = None) -> dict:
+def request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    *,
+    notion_version: str | None = None,
+) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     url = f"https://api.notion.com/v1{path}"
     headers = {
         "Authorization": f"Bearer {notion_token()}",
-        "Notion-Version": NOTION_VERSION,
+        "Notion-Version": notion_version or NOTION_VERSION,
         "Content-Type": "application/json",
     }
     last_error: BaseException | None = None
@@ -710,6 +724,23 @@ def chunks(items: list[dict], size: int = 100):
         yield items[index : index + size]
 
 
+def natural_sort_parts(text: str) -> list[object]:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def markdown_sort_key(path: pathlib.Path) -> tuple:
+    """Sort paths for navigation: root README first, then 01-, 02-, ... with natural order."""
+    rel = path.relative_to(ROOT)
+    if rel.name == "README.md" and len(rel.parts) == 1:
+        return (0, 0, (), "")
+    parts = rel.parts
+    section = 999
+    if parts and parts[0][:2].isdigit():
+        section = int(parts[0][:2])
+    subpath = parts[1:] if len(parts) > 1 else ()
+    return (1, section, tuple(natural_sort_parts("/".join(subpath))), natural_sort_parts(rel.name))
+
+
 def page_title(path: pathlib.Path) -> str:
     if path.name == "README.md" and path.parent == ROOT:
         return "Rhythm Robo DJ 设计总览"
@@ -890,6 +921,59 @@ def create_page(title: str) -> str:
     return page_id
 
 
+def move_page_under_parent(page_id: str, parent_page_id: str | None = None) -> None:
+    parent_page_id = parent_page_id or notion_parent_page_id()
+    request(
+        "POST",
+        f"/pages/{page_id}/move",
+        {"parent": {"type": "page_id", "page_id": parent_page_id}},
+        notion_version=NOTION_MOVE_PAGE_VERSION,
+    )
+
+
+def reorder_parent_child_pages(files: list[pathlib.Path]) -> None:
+    """Reorder subpages on the Notion parent to match markdown_sort_key (newest API)."""
+    if not REORDER_PARENT_PAGES:
+        return
+
+    parent_id = notion_parent_page_id()
+    ordered_ids: list[str] = []
+    for path in files:
+        title = page_title(path)
+        page_id = CHILD_PAGE_INDEX.get(title)
+        if page_id:
+            ordered_ids.append(page_id)
+
+    if len(ordered_ids) < 2:
+        return
+
+    started_at = time.perf_counter()
+    log_progress(f"Reordering {len(ordered_ids)} child pages on parent (navigation order)...")
+    failed = 0
+    for index, page_id in enumerate(ordered_ids, start=1):
+        try:
+            move_page_under_parent(page_id, parent_id)
+        except RuntimeError as exc:
+            failed += 1
+            print(
+                f"Warning: could not reorder page {page_id} ({index}/{len(ordered_ids)}): {exc}",
+                file=sys.stderr,
+            )
+        if index % 5 == 0:
+            time.sleep(0.1)
+
+    if failed:
+        log_progress(
+            f"Reorder finished with {failed} errors in "
+            f"{format_duration(time.perf_counter() - started_at)}. "
+            "Set NOTION_MOVE_PAGE_VERSION=2025-09-03 (or newer) if move is unsupported."
+        )
+    else:
+        log_progress(
+            f"Reorder complete in {format_duration(time.perf_counter() - started_at)}."
+        )
+
+
 def ensure_pages(files: list[pathlib.Path]) -> None:
     started_at = time.perf_counter()
     created = 0
@@ -1022,7 +1106,7 @@ def markdown_files() -> list[pathlib.Path]:
         if rel_parts[0] in SKIP_DIRS:
             continue
         files.append(path)
-    return sorted(files)
+    return sorted(files, key=markdown_sort_key)
 
 
 def build_sync_items(files: list[pathlib.Path]) -> list[tuple[pathlib.Path, list[dict]]]:
@@ -1070,10 +1154,33 @@ def main() -> int:
             total=len(sync_items),
             sync_started_at=sync_started_at,
         )
+    reorder_parent_child_pages(files)
     log_progress(
         f"Notion sync complete in {format_duration(time.perf_counter() - started_at)}."
     )
     return 0
+
+
+def _test_markdown_sort_order() -> None:
+    paths = [
+        ROOT / "05-路线图/研发里程碑.md",
+        ROOT / "README.md",
+        ROOT / "02-算法设计/强化学习舞蹈控制.md",
+        ROOT / "02-算法设计/01-数学推导-02-机器人音乐与MDP.md",
+        ROOT / "01-项目总览/目标与边界.md",
+        ROOT / "03-软件架构/MuJoCo与Conda仿真平台.md",
+    ]
+    ordered = sorted(paths, key=markdown_sort_key)
+    assert ordered[0].relative_to(ROOT).as_posix() == "README.md"
+    assert ordered[1].relative_to(ROOT).parts[0] == "01-项目总览"
+    last_02 = max(
+        i for i, p in enumerate(ordered) if p.relative_to(ROOT).parts[0] == "02-算法设计"
+    )
+    first_03 = min(
+        i for i, p in enumerate(ordered) if p.relative_to(ROOT).parts[0] == "03-软件架构"
+    )
+    assert last_02 < first_03
+    print("markdown_sort_order test OK")
 
 
 def _test_block_children_path() -> None:
@@ -1097,6 +1204,7 @@ def _test_rich_text() -> None:
 
 def _test_markdown_to_blocks() -> None:
     """Smoke-test markdown parsing (no Notion API). Run: python3 scripts/sync_notion.py --test-markdown"""
+    _test_markdown_sort_order()
     _test_block_children_path()
     _test_rich_text()
     sample = """### 1.2 带约束

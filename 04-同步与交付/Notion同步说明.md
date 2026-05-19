@@ -69,6 +69,25 @@ python3 scripts/sync_notion.py
 
 若某页在 Notion 上仍有大量旧 blocks（例如拆分前的单页），同步脚本会在子块数超过 `200` 且新内容明显更短时**自动归档旧页并新建同名页**（环境变量 `NOTION_RECREATE_CHILDREN_THRESHOLD` 可改）。
 
+## 父页面子页面排序
+
+Notion 侧边栏子页面顺序默认是**创建时间**，不是文件名。后加的 `02-算法设计 / 01-数学推导-*` 会排在 `03-软件架构` 后面。
+
+同步结束后脚本会按仓库路径**自然排序**重排父页面下的子页面：
+
+1. 根目录 `README.md`（Rhythm Robo DJ 设计总览）
+2. `01-项目总览` → `02-算法设计`（含全部分册）→ `03-软件架构` → …
+
+依赖 Notion [Move a page](https://developers.notion.com/reference/move-page) API，默认 `NOTION_MOVE_PAGE_VERSION=2025-09-03`。若重排失败，可在 `.env.local` 中尝试：
+
+```bash
+NOTION_MOVE_PAGE_VERSION=2025-09-03
+# 或关闭重排（仅影响导航顺序，不影响正文同步）：
+# NOTION_REORDER_PARENT_PAGES=0
+```
+
+重排完成后刷新 Notion 父页面即可看到与仓库一致的目录顺序。
+
 ## 页面命名规则
 
 同步脚本会把 Markdown 路径转换成 Notion 页面标题：
